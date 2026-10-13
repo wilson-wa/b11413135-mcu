@@ -34,6 +34,7 @@
 /* USER CODE BEGIN PD */
 #define QUEUE_SIZE   11U    // 環形緩衝 11 格，犧牲一格 → 最多排 10 人
 #define DEBOUNCE_MS  300U   // 按鈕去彈跳時間
+#define RX_RING_SIZE 64U    // UART 收字的環形緩衝大小（Lab4 是 256）
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -51,6 +52,15 @@ static uint8_t  qTail = 0U;                 // 下一個要叫的位置
 static uint16_t nextTicket = 1U;            // 下一張號碼牌
 static volatile uint8_t ticketFlag = 0U;    // 中斷登記：有人按抽號
 static uint32_t lastTicketTick = 0U;        // 上次抽號的時間（去彈跳用）
+static uint16_t currentNumber = 0U;         // 正在叫的號碼，0 = 目前沒有
+
+/* UART 收指令用（跟 Lab4 一樣：中斷收字放進 rxRing，主迴圈再組成一行） */
+static uint8_t rxByte;                      // 中斷每次收 1 個字放這裡
+static volatile uint8_t rxRing[RX_RING_SIZE];
+static volatile uint8_t rxHead = 0U;        // 中斷寫入的位置
+static volatile uint8_t rxTail = 0U;        // 主迴圈讀取的位置
+static char lineBuffer[16];                 // 組成一行指令
+static uint8_t lineLength = 0U;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -63,6 +73,13 @@ static uint8_t QueueCount(void);
 static uint8_t QueuePush(uint16_t number);
 static void UpdateLeds(void);
 static void TakeTicket(void);
+static uint8_t QueuePop(uint16_t *number);
+static void CallNext(void);
+static void ListQueue(void);
+static void ExecuteCommand(const char *cmd);
+static void ProcessReceivedByte(uint8_t data);
+static void RxRingPush(uint8_t data);
+static uint8_t RxRingPop(uint8_t *data);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -89,9 +106,11 @@ static uint8_t QueuePush(uint16_t number)
   return 1U;
 }
 
-/* 黃燈：有人在排隊就亮 */
+/* 燈號：綠燈 = 有人正在被叫號，黃燈 = 有人在排隊 */
 static void UpdateLeds(void)
 {
+  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_8,
+                    (currentNumber != 0U) ? GPIO_PIN_SET : GPIO_PIN_RESET);
   HAL_GPIO_WritePin(GPIOC, GPIO_PIN_5,
                     (QueueCount() > 0U) ? GPIO_PIN_SET : GPIO_PIN_RESET);
 }
@@ -112,6 +131,132 @@ static void TakeTicket(void)
   UART_Print(msg);
   nextTicket++;
   UpdateLeds();
+}
+
+/* 叫號：從 tail 拿出最早抽號的人，空的回傳 0 */
+static uint8_t QueuePop(uint16_t *number)
+{
+  if (qHead == qTail) return 0U;     // head 等於 tail → 沒人排隊
+  *number = queue[qTail];
+  qTail = (uint8_t)((qTail + 1U) % QUEUE_SIZE);
+  return 1U;
+}
+
+/* next：叫下一位 */
+static void CallNext(void)
+{
+  char msg[64];
+  uint16_t number;
+
+  if (QueuePop(&number) == 0U)
+  {
+    currentNumber = 0U;
+    UART_Print("No one is waiting.\r\n");
+  }
+  else
+  {
+    currentNumber = number;
+    snprintf(msg, sizeof(msg), "Now serving #%u (%u waiting).\r\n",
+             (unsigned int)currentNumber, (unsigned int)QueueCount());
+    UART_Print(msg);
+  }
+  UpdateLeds();
+}
+
+/* list：列出正在叫的號碼和排隊名單（從 tail 走到 head） */
+static void ListQueue(void)
+{
+  char msg[128];
+  int len;
+  uint8_t i;
+
+  if (currentNumber != 0U)
+    len = snprintf(msg, sizeof(msg), "Serving: #%u | Waiting:", (unsigned int)currentNumber);
+  else
+    len = snprintf(msg, sizeof(msg), "Serving: none | Waiting:");
+
+  if (QueueCount() == 0U)
+  {
+    len += snprintf(msg + len, sizeof(msg) - len, " (empty)");
+  }
+  for (i = qTail; i != qHead; i = (uint8_t)((i + 1U) % QUEUE_SIZE))
+  {
+    len += snprintf(msg + len, sizeof(msg) - len, " #%u", (unsigned int)queue[i]);
+  }
+  snprintf(msg + len, sizeof(msg) - len, "\r\n");
+  UART_Print(msg);
+}
+
+/* 判斷店員打的指令（跟 Lab4 的 ExecuteCommand 一樣用 strcmp） */
+static void ExecuteCommand(const char *cmd)
+{
+  char msg[48];
+
+  if (strcmp(cmd, "next") == 0)
+  {
+    CallNext();
+  }
+  else if (strcmp(cmd, "list") == 0)
+  {
+    ListQueue();
+  }
+  else if (strcmp(cmd, "skip") == 0)
+  {
+    if (currentNumber == 0U)
+    {
+      UART_Print("No one is being served.\r\n");
+    }
+    else
+    {
+      snprintf(msg, sizeof(msg), "#%u skipped.\r\n", (unsigned int)currentNumber);
+      UART_Print(msg);
+      CallNext();                    // 過號後直接叫下一位
+    }
+  }
+  else if (cmd[0] == '\0')
+  {
+    /* 空白行，不處理 */
+  }
+  else
+  {
+    UART_Print("Unknown command. Use: next / list / skip\r\n");
+  }
+}
+
+/* 一個字一個字組成一行，看到換行才執行（跟 Lab4 的 ProcessReceivedByte 一樣）
+   不同的終端機按 Enter 送出的可能是 CR、LF 或 CR+LF，所以兩種都當成「一行結束」 */
+static void ProcessReceivedByte(uint8_t data)
+{
+  if ((data == '\r') || (data == '\n'))
+  {
+    if (lineLength > 0U)             // CR+LF 會連續來兩個，第二個是空行就跳過
+    {
+      lineBuffer[lineLength] = '\0';
+      ExecuteCommand(lineBuffer);
+      lineLength = 0U;
+    }
+  }
+  else if (lineLength < sizeof(lineBuffer) - 1U)
+  {
+    lineBuffer[lineLength++] = (char)data;
+  }
+}
+
+/* 收字的環形緩衝（跟 Lab4 的 RingPush / RingPop 一樣） */
+static void RxRingPush(uint8_t data)
+{
+  uint8_t next = (uint8_t)((rxHead + 1U) % RX_RING_SIZE);
+  if (next == rxTail) return;        // 滿了就丟掉
+  rxRing[rxHead] = data;
+  rxHead = next;
+}
+
+static uint8_t RxRingPop(uint8_t *data)
+{
+  if (rxHead == rxTail) return 0U;
+  *data = rxRing[rxTail];
+  rxTail = (uint8_t)((rxTail + 1U) % RX_RING_SIZE);
+  return 1U;
 }
 /* USER CODE END 0 */
 
@@ -161,6 +306,12 @@ int main(void)
   UART_Print("\r\n=== Smart Queue System ===\r\n");
   UART_Print("Press PC9 to take a number.\r\n");
   UART_Print("Commands: next / list / skip\r\n");
+
+  /* 開始用中斷接收第一個字（Lab4 一樣） */
+  if (HAL_UART_Receive_IT(&hlpuart1, &rxByte, 1U) != HAL_OK)
+  {
+    Error_Handler();
+  }
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -181,6 +332,13 @@ int main(void)
         lastTicketTick = HAL_GetTick();
         TakeTicket();
       }
+    }
+
+    /* 主迴圈處理店員指令：把中斷收到的字拿出來組成一行 */
+    uint8_t data;
+    while (RxRingPop(&data) != 0U)
+    {
+      ProcessReceivedByte(data);
     }
   }
   /* USER CODE END 3 */
@@ -339,6 +497,14 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
   {
     ticketFlag = 1U;
   }
+}
+
+/* UART 收到 1 個字：放進 rxRing，再約下一個字（Lab4 一樣） */
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+  if (huart->Instance != LPUART1) return;
+  RxRingPush(rxByte);
+  HAL_UART_Receive_IT(huart, &rxByte, 1U);
 }
 /* USER CODE END 4 */
 
