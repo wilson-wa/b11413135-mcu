@@ -22,6 +22,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include <string.h>
+#include <stdio.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -31,7 +32,8 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+#define QUEUE_SIZE   11U    // 環形緩衝 11 格，犧牲一格 → 最多排 10 人
+#define DEBOUNCE_MS  300U   // 按鈕去彈跳時間
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -43,7 +45,12 @@
 UART_HandleTypeDef hlpuart1;
 
 /* USER CODE BEGIN PV */
-
+static uint16_t queue[QUEUE_SIZE];          // 排隊名單（存號碼）
+static uint8_t  qHead = 0U;                 // 下一個抽號要放的位置
+static uint8_t  qTail = 0U;                 // 下一個要叫的位置
+static uint16_t nextTicket = 1U;            // 下一張號碼牌
+static volatile uint8_t ticketFlag = 0U;    // 中斷登記：有人按抽號
+static uint32_t lastTicketTick = 0U;        // 上次抽號的時間（去彈跳用）
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -52,6 +59,10 @@ static void MX_GPIO_Init(void);
 static void MX_LPUART1_UART_Init(void);
 /* USER CODE BEGIN PFP */
 static void UART_Print(const char *msg);
+static uint8_t QueueCount(void);
+static uint8_t QueuePush(uint16_t number);
+static void UpdateLeds(void);
+static void TakeTicket(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -60,6 +71,47 @@ static void UART_Print(const char *msg);
 static void UART_Print(const char *msg)
 {
   HAL_UART_Transmit(&hlpuart1, (uint8_t *)msg, strlen(msg), 100U);
+}
+
+/* 目前排隊人數：head 和 tail 的距離 */
+static uint8_t QueueCount(void)
+{
+  return (uint8_t)((qHead + QUEUE_SIZE - qTail) % QUEUE_SIZE);
+}
+
+/* 抽號：把號碼放進 head，滿了回傳 0（跟 Lab4 的 RingPush 一樣） */
+static uint8_t QueuePush(uint16_t number)
+{
+  uint8_t next = (uint8_t)((qHead + 1U) % QUEUE_SIZE);
+  if (next == qTail) return 0U;      // 下一格撞到 tail → 滿了
+  queue[qHead] = number;
+  qHead = next;
+  return 1U;
+}
+
+/* 黃燈：有人在排隊就亮 */
+static void UpdateLeds(void)
+{
+  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_5,
+                    (QueueCount() > 0U) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+}
+
+/* 客人抽號：放進名單，告訴他前面有幾個人 */
+static void TakeTicket(void)
+{
+  char msg[64];
+  uint8_t ahead = QueueCount();      // 放進去之前的人數 = 前面有幾人
+
+  if (QueuePush(nextTicket) == 0U)
+  {
+    UART_Print("Queue is full, please wait.\r\n");
+    return;
+  }
+  snprintf(msg, sizeof(msg), "Ticket #%u taken, %u people ahead.\r\n",
+           (unsigned int)nextTicket, (unsigned int)ahead);
+  UART_Print(msg);
+  nextTicket++;
+  UpdateLeds();
 }
 /* USER CODE END 0 */
 
@@ -118,6 +170,18 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    /* 主迴圈處理抽號：中斷只登記，這裡才真的做事 */
+    if (ticketFlag)
+    {
+      ticketFlag = 0U;
+      /* 去彈跳：距離上次超過 300 ms，而且按鈕現在真的是按下（0）才算數 */
+      if ((HAL_GetTick() - lastTicketTick >= DEBOUNCE_MS) &&
+          (HAL_GPIO_ReadPin(TICKET_BTN_GPIO_Port, TICKET_BTN_Pin) == GPIO_PIN_RESET))
+      {
+        lastTicketTick = HAL_GetTick();
+        TakeTicket();
+      }
+    }
   }
   /* USER CODE END 3 */
 }
@@ -268,7 +332,14 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
-
+/* 按鈕中斷：只登記，馬上離開（ISR 要短） */
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+  if (GPIO_Pin == TICKET_BTN_Pin)
+  {
+    ticketFlag = 1U;
+  }
+}
 /* USER CODE END 4 */
 
 /**
