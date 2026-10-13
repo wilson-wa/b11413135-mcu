@@ -21,7 +21,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include <string.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -51,12 +51,16 @@ void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_LPUART1_UART_Init(void);
 /* USER CODE BEGIN PFP */
-
+static void UART_Print(const char *msg);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-
+/* 透過 UART 傳一段文字給電腦（Lab4 的 HAL_UART_Transmit 包成函式） */
+static void UART_Print(const char *msg)
+{
+  HAL_UART_Transmit(&hlpuart1, (uint8_t *)msg, strlen(msg), 100U);
+}
 /* USER CODE END 0 */
 
 /**
@@ -90,7 +94,21 @@ int main(void)
   MX_GPIO_Init();
   MX_LPUART1_UART_Init();
   /* USER CODE BEGIN 2 */
+  /* 開機自我測試：綠 → 黃 → 紅 各亮 0.3 秒，確認三顆燈接線正確 */
+  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_8, GPIO_PIN_SET);    // 綠
+  HAL_Delay(300);
+  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_8, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_5, GPIO_PIN_SET);    // 黃
+  HAL_Delay(300);
+  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_5, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_6, GPIO_PIN_SET);    // 紅
+  HAL_Delay(300);
+  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_6, GPIO_PIN_RESET);
 
+  /* 歡迎訊息 */
+  UART_Print("\r\n=== Smart Queue System ===\r\n");
+  UART_Print("Press PC9 to take a number.\r\n");
+  UART_Print("Commands: next / list / skip\r\n");
   /* USER CODE END 2 */
 
   /* Infinite loop */
