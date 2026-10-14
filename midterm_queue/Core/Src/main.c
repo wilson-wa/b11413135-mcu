@@ -35,6 +35,8 @@
 #define QUEUE_SIZE   11U    // 環形緩衝 11 格，犧牲一格 → 最多排 10 人
 #define DEBOUNCE_MS  300U   // 按鈕去彈跳時間
 #define RX_RING_SIZE 64U    // UART 收字的環形緩衝大小（Lab4 是 256）
+#define CALL_TIMEOUT_MS 10000U  // 叫號後 10 秒沒回應就自動過號
+#define BLINK_MS     250U   // 叫號中綠燈閃爍的速度
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -53,6 +55,12 @@ static uint16_t nextTicket = 1U;            // 下一張號碼牌
 static volatile uint8_t ticketFlag = 0U;    // 中斷登記：有人按抽號
 static uint32_t lastTicketTick = 0U;        // 上次抽號的時間（去彈跳用）
 static uint16_t currentNumber = 0U;         // 正在叫的號碼，0 = 目前沒有
+static uint8_t  arrived = 0U;               // 客人到了沒（店員打 ok 設為 1）
+static uint32_t callStartTick = 0U;         // 開始叫號的時間（10 秒倒數用）
+static uint32_t lastBlinkTick = 0U;         // 上次綠燈切換的時間
+static volatile uint8_t emergencyFlag = 0U; // 中斷登記：有人按 PC13 緊急按鈕
+static uint8_t  emergency = 0U;             // 目前是不是緊急暫停中
+static uint32_t lastStopTick = 0U;          // 上次按緊急按鈕的時間（去彈跳用）
 
 /* UART 收指令用（跟 Lab4 一樣：中斷收字放進 rxRing，主迴圈再組成一行） */
 static uint8_t rxByte;                      // 中斷每次收 1 個字放這裡
@@ -80,6 +88,7 @@ static void ExecuteCommand(const char *cmd);
 static void ProcessReceivedByte(uint8_t data);
 static void RxRingPush(uint8_t data);
 static uint8_t RxRingPop(uint8_t *data);
+static void ToggleEmergency(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -121,6 +130,12 @@ static void TakeTicket(void)
   char msg[64];
   uint8_t ahead = QueueCount();      // 放進去之前的人數 = 前面有幾人
 
+  if (emergency)
+  {
+    UART_Print("EMERGENCY: service paused, please wait.\r\n");
+    return;
+  }
+
   if (QueuePush(nextTicket) == 0U)
   {
     UART_Print("Queue is full, please wait.\r\n");
@@ -156,6 +171,9 @@ static void CallNext(void)
   else
   {
     currentNumber = number;
+    arrived = 0U;                    // 新叫的號碼，客人還沒到
+    callStartTick = HAL_GetTick();   // 開始 10 秒倒數
+    lastBlinkTick = callStartTick;
     snprintf(msg, sizeof(msg), "Now serving #%u (%u waiting).\r\n",
              (unsigned int)currentNumber, (unsigned int)QueueCount());
     UART_Print(msg);
@@ -170,10 +188,16 @@ static void ListQueue(void)
   int len;
   uint8_t i;
 
-  if (currentNumber != 0U)
-    len = snprintf(msg, sizeof(msg), "Serving: #%u | Waiting:", (unsigned int)currentNumber);
+  if (emergency)
+    len = snprintf(msg, sizeof(msg), "[EMERGENCY] ");
   else
-    len = snprintf(msg, sizeof(msg), "Serving: none | Waiting:");
+    len = 0;
+
+  if (currentNumber != 0U)
+    len += snprintf(msg + len, sizeof(msg) - len, "Serving: #%u (%s) | Waiting:",
+                   (unsigned int)currentNumber, arrived ? "arrived" : "calling");
+  else
+    len += snprintf(msg + len, sizeof(msg) - len, "Serving: none | Waiting:");
 
   if (QueueCount() == 0U)
   {
@@ -192,6 +216,13 @@ static void ExecuteCommand(const char *cmd)
 {
   char msg[48];
 
+  /* 緊急暫停中：只允許 list 查詢，其他服務指令都擋下來 */
+  if (emergency && (strcmp(cmd, "list") != 0) && (cmd[0] != '\0'))
+  {
+    UART_Print("EMERGENCY: service paused. Press PC13 to resume.\r\n");
+    return;
+  }
+
   if (strcmp(cmd, "next") == 0)
   {
     CallNext();
@@ -199,6 +230,25 @@ static void ExecuteCommand(const char *cmd)
   else if (strcmp(cmd, "list") == 0)
   {
     ListQueue();
+  }
+  else if (strcmp(cmd, "ok") == 0)
+  {
+    if (currentNumber == 0U)
+    {
+      UART_Print("No one is being served.\r\n");
+    }
+    else if (arrived)
+    {
+      snprintf(msg, sizeof(msg), "#%u already arrived.\r\n", (unsigned int)currentNumber);
+      UART_Print(msg);
+    }
+    else
+    {
+      arrived = 1U;                  // 客人到了：停止倒數
+      HAL_GPIO_WritePin(GPIOC, GPIO_PIN_8, GPIO_PIN_SET);   // 綠燈改恆亮
+      snprintf(msg, sizeof(msg), "#%u arrived.\r\n", (unsigned int)currentNumber);
+      UART_Print(msg);
+    }
   }
   else if (strcmp(cmd, "skip") == 0)
   {
@@ -219,7 +269,7 @@ static void ExecuteCommand(const char *cmd)
   }
   else
   {
-    UART_Print("Unknown command. Use: next / list / skip\r\n");
+    UART_Print("Unknown command. Use: next / ok / list / skip\r\n");
   }
 }
 
@@ -235,6 +285,10 @@ static void ProcessReceivedByte(uint8_t data)
       ExecuteCommand(lineBuffer);
       lineLength = 0U;
     }
+  }
+  else if ((data == 0x08U) || (data == 0x7FU))   // Backspace：刪掉前一個字
+  {
+    if (lineLength > 0U) lineLength--;
   }
   else if (lineLength < sizeof(lineBuffer) - 1U)
   {
@@ -257,6 +311,28 @@ static uint8_t RxRingPop(uint8_t *data)
   *data = rxRing[rxTail];
   rxTail = (uint8_t)((rxTail + 1U) % RX_RING_SIZE);
   return 1U;
+}
+
+/* 緊急暫停／恢復：按一次 PC13 暫停，再按一次恢復 */
+static void ToggleEmergency(void)
+{
+  if (emergency == 0U)
+  {
+    emergency = 1U;
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_6, GPIO_PIN_SET);     // 紅燈恆亮
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_8, GPIO_PIN_RESET);   // 綠燈、黃燈關掉
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_5, GPIO_PIN_RESET);
+    UART_Print("!!! EMERGENCY STOP: service paused !!!\r\n");
+  }
+  else
+  {
+    emergency = 0U;
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_6, GPIO_PIN_RESET);   // 紅燈熄滅
+    callStartTick = HAL_GetTick();   // 恢復後重新給叫號中的客人 10 秒
+    lastBlinkTick = callStartTick;
+    UpdateLeds();                    // 綠燈、黃燈恢復原本狀態
+    UART_Print("Service resumed.\r\n");
+  }
 }
 /* USER CODE END 0 */
 
@@ -305,7 +381,8 @@ int main(void)
   /* 歡迎訊息 */
   UART_Print("\r\n=== Smart Queue System ===\r\n");
   UART_Print("Press PC9 to take a number.\r\n");
-  UART_Print("Commands: next / list / skip\r\n");
+  UART_Print("Commands: next / ok / list / skip\r\n");
+  UART_Print("Blue button (PC13): emergency stop / resume\r\n");
 
   /* 開始用中斷接收第一個字（Lab4 一樣） */
   if (HAL_UART_Receive_IT(&hlpuart1, &rxByte, 1U) != HAL_OK)
@@ -331,6 +408,36 @@ int main(void)
       {
         lastTicketTick = HAL_GetTick();
         TakeTicket();
+      }
+    }
+
+    /* 緊急按鈕：中斷只登記，這裡處理（去彈跳＋按鈕現在真的是按下＝1） */
+    if (emergencyFlag)
+    {
+      emergencyFlag = 0U;
+      if ((HAL_GetTick() - lastStopTick >= DEBOUNCE_MS) &&
+          (HAL_GPIO_ReadPin(STOP_BTN_GPIO_Port, STOP_BTN_Pin) == GPIO_PIN_SET))
+      {
+        lastStopTick = HAL_GetTick();
+        ToggleEmergency();
+      }
+    }
+
+    /* 叫號中（客人還沒到）：綠燈閃爍，超過 10 秒自動過號（緊急暫停時不倒數） */
+    if ((emergency == 0U) && (currentNumber != 0U) && (arrived == 0U))
+    {
+      if (HAL_GetTick() - callStartTick >= CALL_TIMEOUT_MS)
+      {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "#%u no response in 10 s, auto skipped.\r\n",
+                 (unsigned int)currentNumber);
+        UART_Print(msg);
+        CallNext();                  // 自動叫下一位
+      }
+      else if (HAL_GetTick() - lastBlinkTick >= BLINK_MS)
+      {
+        lastBlinkTick = HAL_GetTick();
+        HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_8);
       }
     }
 
@@ -496,6 +603,10 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
   if (GPIO_Pin == TICKET_BTN_Pin)
   {
     ticketFlag = 1U;
+  }
+  else if (GPIO_Pin == STOP_BTN_Pin)
+  {
+    emergencyFlag = 1U;              // 緊急按鈕：優先權 0，可以插隊任何中斷
   }
 }
 
