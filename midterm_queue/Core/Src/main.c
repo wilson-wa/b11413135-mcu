@@ -36,7 +36,8 @@
 #define DEBOUNCE_MS  300U   // 按鈕去彈跳時間
 #define RX_RING_SIZE 64U    // UART 收字的環形緩衝大小（Lab4 是 256）
 #define CALL_TIMEOUT_MS 10000U  // 叫號後 10 秒沒回應就自動過號
-#define BLINK_MS     250U   // 叫號中綠燈閃爍的速度
+#define BREATH_STEP_MS 10U  // 呼吸燈每 10 ms 改一次亮度（Lab5 Challenge 一樣）
+#define LED_FULL     19999U // PWM 最亮的 CCR 值 = ARR（TIM3：PSC 84、ARR 19999 → 100 Hz）
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -59,7 +60,9 @@ static uint32_t lastTicketTick = 0U;        // 上次抽號的時間（去彈跳
 static uint16_t currentNumber = 0U;         // 正在叫的號碼，0 = 目前沒有
 static uint8_t  arrived = 0U;               // 客人到了沒（店員打 ok 設為 1）
 static uint32_t callStartTick = 0U;         // 開始叫號的時間（10 秒倒數用）
-static uint32_t lastBlinkTick = 0U;         // 上次綠燈切換的時間
+static uint32_t lastBlinkTick = 0U;         // 上次改呼吸燈亮度的時間
+static int32_t  breathLevel = 0;            // 綠燈呼吸亮度等級 0～100
+static int32_t  breathDir = 1;              // +1 變亮、-1 變暗
 static volatile uint8_t emergencyFlag = 0U; // 中斷登記：有人按 PC13 緊急按鈕
 static uint8_t  emergency = 0U;             // 目前是不是緊急暫停中
 static uint32_t lastStopTick = 0U;          // 上次按緊急按鈕的時間（去彈跳用）
@@ -92,6 +95,8 @@ static void ProcessReceivedByte(uint8_t data);
 static void RxRingPush(uint8_t data);
 static uint8_t RxRingPop(uint8_t *data);
 static void ToggleEmergency(void);
+static void SetGreen(uint32_t ccr);
+static void SetYellow(uint32_t ccr);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -118,13 +123,31 @@ static uint8_t QueuePush(uint16_t number)
   return 1U;
 }
 
-/* 燈號：綠燈 = 有人正在被叫號，黃燈 = 有人在排隊 */
+/* 綠燈（PC8 = TIM3_CH3）：改 CCR 就是改亮度（Lab5 一樣） */
+static void SetGreen(uint32_t ccr)
+{
+  __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_3, ccr);
+}
+
+/* 黃燈（PC7 = TIM3_CH2） */
+static void SetYellow(uint32_t ccr)
+{
+  __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, ccr);
+}
+
+/* 燈號：
+   綠燈：沒人叫號 = 滅、叫號中 = 呼吸（主迴圈處理）、客人已到 = 最亮
+   黃燈：亮度 = 排隊人數，0 人熄滅、10 人最亮（平方曲線，人少時變化看得出來） */
 static void UpdateLeds(void)
 {
-  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_8,
-                    (currentNumber != 0U) ? GPIO_PIN_SET : GPIO_PIN_RESET);
-  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_5,
-                    (QueueCount() > 0U) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+  uint32_t count = QueueCount();
+  uint32_t maxCount = QUEUE_SIZE - 1U;              // 最多 10 人
+
+  if (currentNumber == 0U)      SetGreen(0U);
+  else if (arrived)             SetGreen(LED_FULL);
+  /* 叫號中：亮度由主迴圈的呼吸燈負責 */
+
+  SetYellow(count * count * LED_FULL / (maxCount * maxCount));
 }
 
 /* 客人抽號：放進名單，告訴他前面有幾個人 */
@@ -177,6 +200,8 @@ static void CallNext(void)
     arrived = 0U;                    // 新叫的號碼，客人還沒到
     callStartTick = HAL_GetTick();   // 開始 10 秒倒數
     lastBlinkTick = callStartTick;
+    breathLevel = 0;                 // 呼吸燈從最暗開始
+    breathDir = 1;
     snprintf(msg, sizeof(msg), "Now serving #%u (%u waiting).\r\n",
              (unsigned int)currentNumber, (unsigned int)QueueCount());
     UART_Print(msg);
@@ -248,7 +273,7 @@ static void ExecuteCommand(const char *cmd)
     else
     {
       arrived = 1U;                  // 客人到了：停止倒數
-      HAL_GPIO_WritePin(GPIOC, GPIO_PIN_8, GPIO_PIN_SET);   // 綠燈改恆亮
+      SetGreen(LED_FULL);            // 綠燈改恆亮（最亮）
       snprintf(msg, sizeof(msg), "#%u arrived.\r\n", (unsigned int)currentNumber);
       UART_Print(msg);
     }
@@ -323,8 +348,8 @@ static void ToggleEmergency(void)
   {
     emergency = 1U;
     HAL_GPIO_WritePin(GPIOC, GPIO_PIN_6, GPIO_PIN_SET);     // 紅燈恆亮
-    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_8, GPIO_PIN_RESET);   // 綠燈、黃燈關掉
-    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_5, GPIO_PIN_RESET);
+    SetGreen(0U);                    // 綠燈、黃燈關掉
+    SetYellow(0U);
     UART_Print("!!! EMERGENCY STOP: service paused !!!\r\n");
   }
   else
@@ -371,13 +396,17 @@ int main(void)
   MX_LPUART1_UART_Init();
   MX_TIM3_Init();
   /* USER CODE BEGIN 2 */
+  /* 啟動 TIM3 的兩路 PWM（Lab5 一樣，沒有 Start 燈不會亮） */
+  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_2);   // PC7 黃燈
+  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_3);   // PC8 綠燈
+
   /* 開機自我測試：綠 → 黃 → 紅 各亮 0.3 秒，確認三顆燈接線正確 */
-  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_8, GPIO_PIN_SET);    // 綠
+  SetGreen(LED_FULL);                                    // 綠
   HAL_Delay(300);
-  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_8, GPIO_PIN_RESET);
-  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_5, GPIO_PIN_SET);    // 黃
+  SetGreen(0U);
+  SetYellow(LED_FULL);                                   // 黃
   HAL_Delay(300);
-  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_5, GPIO_PIN_RESET);
+  SetYellow(0U);
   HAL_GPIO_WritePin(GPIOC, GPIO_PIN_6, GPIO_PIN_SET);    // 紅
   HAL_Delay(300);
   HAL_GPIO_WritePin(GPIOC, GPIO_PIN_6, GPIO_PIN_RESET);
@@ -427,7 +456,7 @@ int main(void)
       }
     }
 
-    /* 叫號中（客人還沒到）：綠燈閃爍，超過 10 秒自動過號（緊急暫停時不倒數） */
+    /* 叫號中（客人還沒到）：綠燈呼吸，超過 10 秒自動過號（緊急暫停時不倒數） */
     if ((emergency == 0U) && (currentNumber != 0U) && (arrived == 0U))
     {
       if (HAL_GetTick() - callStartTick >= CALL_TIMEOUT_MS)
@@ -438,10 +467,14 @@ int main(void)
         UART_Print(msg);
         CallNext();                  // 自動叫下一位
       }
-      else if (HAL_GetTick() - lastBlinkTick >= BLINK_MS)
+      else if (HAL_GetTick() - lastBlinkTick >= BREATH_STEP_MS)
       {
+        /* 呼吸燈：每 10 ms 亮度走 4 格，0→100→0 約 0.5 秒一次（比 Lab5 快，看起來像在呼叫） */
         lastBlinkTick = HAL_GetTick();
-        HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_8);
+        breathLevel += breathDir * 4;
+        if (breathLevel >= 100) { breathLevel = 100; breathDir = -1; }
+        else if (breathLevel <= 0) { breathLevel = 0; breathDir = 1; }
+        SetGreen((uint32_t)(breathLevel * breathLevel) * LED_FULL / 10000U);
       }
     }
 
